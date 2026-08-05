@@ -11,13 +11,25 @@ pipeline {
         AWS_PAGER               = ''
         EXPECTED_AWS_ACCOUNT_ID = '800960612118'
         ECR_REPOSITORY          = 'dotnet-aspnetapp'
+        KUBECONFIG             = '/home/jenkins/.kube/config'
+        KIND_CLUSTER_NAME      = 'dotnet-staging'
+        K8S_CONTEXT            = 'kind-dotnet-staging'
+        K8S_NAMESPACE          = 'aspnetapp-staging'
+        K8S_DEPLOYMENT         = 'aspnetapp'
+        K8S_SERVICE            = 'aspnetapp'
+        K8S_ECR_PULL_SECRET    = 'ecr-registry'
+        K8S_HOST_PORT          = '18081'
+
+        K8S_DEPLOYMENT_STARTED = 'false'
+        K8S_DEPLOYMENT_APPLIED = 'false'
+        K8S_DEPLOYMENT_EXISTED = 'false'
     }
 
     options {
         skipDefaultCheckout(true)
         timestamps()
         disableConcurrentBuilds()
-        timeout(time: 45, unit: 'MINUTES')
+        timeout(time: 60, unit: 'MINUTES')
 
         buildDiscarder(
             logRotator(
@@ -165,6 +177,13 @@ test -d samples/aspnetapp/aspnetapp
 test -f samples/aspnetapp/aspnetapp/aspnetapp.csproj
 test -f samples/aspnetapp/aspnetapp/Program.cs
 
+test -f deploy/kind/cluster-config.yaml
+test -f deploy/k8s/staging/namespace.yaml
+test -f deploy/k8s/staging/service-account.yaml
+test -f deploy/k8s/staging/service.yaml
+test -f deploy/k8s/staging/pod-disruption-budget.yaml
+test -f deploy/k8s/staging/deployment.yaml.tpl
+
 echo "ASP.NET application directory:"
 ls -la samples/aspnetapp
 
@@ -175,6 +194,10 @@ ls -la samples/aspnetapp/aspnetapp
 echo
 echo "Dockerfile:"
 sed -n '1,220p' samples/aspnetapp/Dockerfile
+
+echo
+echo "Kubernetes deployment files:"
+find deploy -maxdepth 4 -type f -print | sort
 
 echo
 echo "Repository validation completed successfully."
@@ -1093,6 +1116,525 @@ echo "Review the scan later in the ECR Console."
                 )
             }
         }
+
+        stage('Verify KIND Cluster') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh(
+                    label: 'Verify KIND cluster, context and nodes',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+command -v kubectl
+command -v kind
+
+test -r "${KUBECONFIG}"
+
+current_context="$(
+  kubectl config current-context
+)"
+
+echo "Current Kubernetes context: ${current_context}"
+
+test "${current_context}" = "${K8S_CONTEXT}"
+
+if ! kind get clusters | grep -Fxq "${KIND_CLUSTER_NAME}"; then
+  echo "KIND cluster ${KIND_CLUSTER_NAME} does not exist." >&2
+  exit 1
+fi
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  cluster-info
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  wait \
+  --for=condition=Ready \
+  nodes \
+  --all \
+  --timeout=180s
+
+node_count="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    get nodes \
+    --no-headers |
+  wc -l |
+  tr -d ' '
+)"
+
+echo "Cluster node count: ${node_count}"
+
+test "${node_count}" -ge 3
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  get nodes \
+  -o wide
+'''
+                )
+            }
+        }
+
+        stage('Prepare Kubernetes Deployment') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                script {
+                    env.K8S_DEPLOY_IMAGE =
+                        "${env.ECR_REGISTRY}/" +
+                        "${env.ECR_REPOSITORY}@" +
+                        "${env.ECR_IMAGE_DIGEST}"
+
+                    env.K8S_CHANGE_CAUSE =
+                        "Jenkins build ${env.BUILD_NUMBER}, " +
+                        "Git ${env.FULL_GIT_COMMIT}, " +
+                        "image ${env.ECR_IMAGE_DIGEST}"
+
+                    env.K8S_DEPLOYMENT_EXISTED = sh(
+                        label: 'Check for an existing Kubernetes Deployment',
+                        returnStdout: true,
+                        script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get deployment "${K8S_DEPLOYMENT}" \
+  >/dev/null 2>&1; then
+
+  printf 'true'
+else
+  printf 'false'
+fi
+'''
+                    ).trim()
+
+                    if (env.K8S_DEPLOYMENT_EXISTED == 'true') {
+                        env.K8S_PREVIOUS_IMAGE = sh(
+                            label: 'Capture previous Kubernetes image',
+                            returnStdout: true,
+                            script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get deployment "${K8S_DEPLOYMENT}" \
+  --output jsonpath='{.spec.template.spec.containers[?(@.name=="aspnetapp")].image}'
+'''
+                        ).trim()
+                    } else {
+                        env.K8S_PREVIOUS_IMAGE = ''
+                    }
+                }
+
+                echo "Deploy image: ${K8S_DEPLOY_IMAGE}"
+                echo "Existing Deployment: ${K8S_DEPLOYMENT_EXISTED}"
+                echo "Previous image: ${K8S_PREVIOUS_IMAGE ?: 'none'}"
+            }
+        }
+
+        stage('Refresh ECR Pull Secret') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh(
+                    label: 'Create or refresh ECR image pull Secret',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  apply \
+  --filename deploy/k8s/staging/namespace.yaml
+
+secret_directory="$(
+  mktemp -d
+)"
+
+trap 'rm -rf "${secret_directory}"' EXIT
+
+chmod 700 "${secret_directory}"
+umask 077
+
+ecr_password="$(
+  aws ecr get-login-password \
+    --region "${AWS_REGION}"
+)"
+
+auth_value="$(
+  printf 'AWS:%s' "${ecr_password}" |
+  base64 \
+    --wrap=0
+)"
+
+jq \
+  --null-input \
+  --arg registry "${ECR_REGISTRY}" \
+  --arg password "${ecr_password}" \
+  --arg auth "${auth_value}" \
+  '{
+    auths: {
+      ($registry): {
+        username: "AWS",
+        password: $password,
+        auth: $auth
+      }
+    }
+  }' \
+  >"${secret_directory}/config.json"
+
+unset ecr_password
+unset auth_value
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  create secret generic "${K8S_ECR_PULL_SECRET}" \
+  --type kubernetes.io/dockerconfigjson \
+  --from-file=".dockerconfigjson=${secret_directory}/config.json" \
+  --dry-run=client \
+  --output yaml |
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  apply \
+  --filename -
+
+secret_type="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get secret "${K8S_ECR_PULL_SECRET}" \
+    --output jsonpath='{.type}'
+)"
+
+echo "ECR pull Secret type: ${secret_type}"
+
+test \
+  "${secret_type}" = \
+  "kubernetes.io/dockerconfigjson"
+
+echo
+echo "ECR image pull Secret refreshed."
+'''
+                )
+            }
+        }
+
+        stage('Render Kubernetes Deployment') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh(
+                    label: 'Render and validate digest-pinned manifests',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+render_directory="${WORKSPACE}/rendered-k8s"
+render_file="${render_directory}/deployment.yaml"
+
+rm -rf "${render_directory}"
+mkdir -p "${render_directory}"
+
+sed \
+  -e "s|__DEPLOY_IMAGE__|${K8S_DEPLOY_IMAGE}|g" \
+  -e "s|__SHORT_COMMIT__|${SHORT_GIT_COMMIT}|g" \
+  -e "s|__FULL_COMMIT__|${FULL_GIT_COMMIT}|g" \
+  -e "s|__BUILD_NUMBER__|${BUILD_NUMBER}|g" \
+  -e "s|__CHANGE_CAUSE__|${K8S_CHANGE_CAUSE}|g" \
+  deploy/k8s/staging/deployment.yaml.tpl \
+  >"${render_file}"
+
+if grep -q '__[A-Z_]*__' "${render_file}"; then
+  echo "Unresolved deployment-template placeholder detected." >&2
+
+  grep \
+    --line-number \
+    '__[A-Z_]*__' \
+    "${render_file}" \
+    >&2
+
+  exit 1
+fi
+
+echo "Rendered Deployment manifest:"
+cat "${render_file}"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  apply \
+  --dry-run=server \
+  --filename deploy/k8s/staging/service-account.yaml \
+  --filename deploy/k8s/staging/service.yaml \
+  --filename deploy/k8s/staging/pod-disruption-budget.yaml \
+  --filename "${render_file}"
+'''
+                )
+            }
+        }
+
+        stage('Deploy to KIND') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                script {
+                    env.K8S_DEPLOYMENT_STARTED = 'true'
+                }
+
+                sh(
+                    label: 'Apply Kubernetes application resources',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  apply \
+  --filename deploy/k8s/staging/service-account.yaml \
+  --filename deploy/k8s/staging/service.yaml \
+  --filename deploy/k8s/staging/pod-disruption-budget.yaml \
+  --filename "${WORKSPACE}/rendered-k8s/deployment.yaml"
+'''
+                )
+
+                script {
+                    env.K8S_DEPLOYMENT_APPLIED = 'true'
+                }
+
+                sh(
+                    label: 'Annotate Kubernetes Deployment',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  annotate deployment "${K8S_DEPLOYMENT}" \
+  "ci.jenkins.io/build-url=${BUILD_URL}" \
+  "ci.jenkins.io/image-digest=${ECR_IMAGE_DIGEST}" \
+  --overwrite
+'''
+                )
+            }
+        }
+
+        stage('Verify Kubernetes Rollout') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh(
+                    label: 'Wait for rolling update and verify resources',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  rollout status \
+  "deployment/${K8S_DEPLOYMENT}" \
+  --timeout=5m
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  wait \
+  --for=condition=Ready \
+  pod \
+  --selector="app.kubernetes.io/name=${K8S_DEPLOYMENT}" \
+  --timeout=180s
+
+actual_image="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get deployment "${K8S_DEPLOYMENT}" \
+    --output jsonpath='{.spec.template.spec.containers[?(@.name=="aspnetapp")].image}'
+)"
+
+desired_replicas="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get deployment "${K8S_DEPLOYMENT}" \
+    --output jsonpath='{.spec.replicas}'
+)"
+
+ready_replicas="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get deployment "${K8S_DEPLOYMENT}" \
+    --output jsonpath='{.status.readyReplicas}'
+)"
+
+echo "Expected image: ${K8S_DEPLOY_IMAGE}"
+echo "Actual image: ${actual_image}"
+echo "Desired replicas: ${desired_replicas}"
+echo "Ready replicas: ${ready_replicas}"
+
+test "${actual_image}" = "${K8S_DEPLOY_IMAGE}"
+test -n "${desired_replicas}"
+test "${ready_replicas}" = "${desired_replicas}"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get deployment,replicaset,pod,service,poddisruptionbudget \
+  -o wide
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get endpointslice \
+  --selector="kubernetes.io/service-name=${K8S_SERVICE}" \
+  -o wide
+'''
+                )
+            }
+        }
+
+        stage('Kubernetes Smoke Test') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh(
+                    label: 'Test application through Kubernetes Service',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+base_url="http://127.0.0.1:${K8S_HOST_PORT}"
+health_url="${base_url}/healthz"
+environment_url="${base_url}/Environment"
+response_file="${WORKSPACE}/kubernetes-environment.json"
+
+service_ready=false
+
+for attempt in $(seq 1 30); do
+  echo "Kubernetes Service smoke-test attempt ${attempt}/30"
+
+  if curl \
+    --fail \
+    --silent \
+    --show-error \
+    "${health_url}" \
+    >/dev/null; then
+
+    service_ready=true
+    break
+  fi
+
+  sleep 2
+done
+
+if [[ "${service_ready}" != "true" ]]; then
+  echo "Kubernetes Service did not become reachable." >&2
+  exit 1
+fi
+
+curl \
+  --fail \
+  --silent \
+  --show-error \
+  --retry 3 \
+  --retry-delay 2 \
+  "${environment_url}" \
+  --output "${response_file}"
+
+echo "Kubernetes application response:"
+jq . "${response_file}"
+
+jq -e '
+  .runtimeVersion != null and
+  .runtimeVersion != "" and
+  .user == "app" and
+  .hostName != null and
+  .hostName != ""
+' "${response_file}" >/dev/null
+
+desired_replicas="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get deployment "${K8S_DEPLOYMENT}" \
+    --output jsonpath='{.spec.replicas}'
+)"
+
+ready_endpoints="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get endpointslice \
+    --selector="kubernetes.io/service-name=${K8S_SERVICE}" \
+    --output json |
+  jq '[
+    .items[].endpoints[]?
+    | select(.conditions.ready == true)
+  ] | length'
+)"
+
+echo "Desired replicas: ${desired_replicas}"
+echo "Ready Service endpoints: ${ready_endpoints}"
+
+test "${ready_endpoints}" -ge "${desired_replicas}"
+
+echo
+echo "Kubernetes smoke test completed successfully."
+'''
+                )
+            }
+        }
+
+        stage('Record Kubernetes Release') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                sh(
+                    label: 'Display rollout history and final state',
+                    script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  rollout history \
+  "deployment/${K8S_DEPLOYMENT}"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get deployment,replicaset,pod,service,endpointslice \
+  -o wide
+
+echo
+echo "Deployed image:"
+echo "${K8S_DEPLOY_IMAGE}"
+
+echo
+echo "Application URL on Jenkins agent:"
+echo "http://127.0.0.1:${K8S_HOST_PORT}"
+'''
+                )
+            }
+        }
+
     }
 
     post {
@@ -1191,22 +1733,151 @@ echo "Docker cleanup completed."
                         "Manifest media type: " +
                         "${env.ECR_MANIFEST_MEDIA_TYPE}"
                     )
+
+                    echo(
+                        "KIND deployment completed: " +
+                        "${env.K8S_DEPLOY_IMAGE}"
+                    )
+
+                    echo(
+                        "KIND application URL: " +
+                        "http://127.0.0.1:${env.K8S_HOST_PORT}"
+                    )
                 } else {
                     echo(
                         'Pull-request image passed local ' +
-                        'Jenkins validation. No ECR push ' +
-                        'was performed.'
+                        'Jenkins validation. No ECR push or ' +
+                        'KIND deployment was performed.'
                     )
                 }
             }
         }
 
         failure {
-            echo 'ASP.NET CI or Amazon ECR publication failed.'
+            script {
+                if (env.K8S_DEPLOYMENT_STARTED == 'true') {
+                    sh(
+                        label: 'Collect Kubernetes failure diagnostics',
+                        script: '''#!/usr/bin/env bash
+set +e
+
+echo "Kubernetes deployment diagnostics:"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get deployment,replicaset,pod,service,endpointslice,poddisruptionbudget \
+  -o wide
+
+echo
+echo "Recent Kubernetes events:"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  get events \
+  --sort-by='.lastTimestamp' |
+tail -n 50
+
+echo
+echo "Deployment description:"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  describe deployment "${K8S_DEPLOYMENT}"
+
+echo
+echo "Pod descriptions and logs:"
+
+for pod in $(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get pods \
+    --selector="app.kubernetes.io/name=${K8S_DEPLOYMENT}" \
+    --output name
+); do
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    describe "${pod}"
+
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    logs "${pod}" \
+    --all-containers \
+    --tail=200 || true
+
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    logs "${pod}" \
+    --all-containers \
+    --previous \
+    --tail=200 || true
+done
+'''
+                    )
+
+                    if (
+                        env.K8S_DEPLOYMENT_APPLIED == 'true' &&
+                        env.K8S_DEPLOYMENT_EXISTED == 'true'
+                    ) {
+                        sh(
+                            label: 'Roll back failed Kubernetes deployment',
+                            script: '''#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "Rolling back to the previous Deployment revision."
+echo "Previous image: ${K8S_PREVIOUS_IMAGE}"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  rollout undo \
+  "deployment/${K8S_DEPLOYMENT}"
+
+kubectl \
+  --context "${K8S_CONTEXT}" \
+  --namespace "${K8S_NAMESPACE}" \
+  rollout status \
+  "deployment/${K8S_DEPLOYMENT}" \
+  --timeout=5m
+
+restored_image="$(
+  kubectl \
+    --context "${K8S_CONTEXT}" \
+    --namespace "${K8S_NAMESPACE}" \
+    get deployment "${K8S_DEPLOYMENT}" \
+    --output jsonpath='{.spec.template.spec.containers[?(@.name=="aspnetapp")].image}'
+)"
+
+echo "Restored image: ${restored_image}"
+
+test "${restored_image}" = "${K8S_PREVIOUS_IMAGE}"
+
+echo "Rollback completed successfully."
+'''
+                        )
+                    } else if (env.K8S_DEPLOYMENT_APPLIED == 'true') {
+                        echo(
+                            'Initial Kubernetes deployment failed after apply. ' +
+                            'There is no previous Deployment revision to restore.'
+                        )
+                    }
+                }
+
+                echo(
+                    'ASP.NET CI, ECR publication, or ' +
+                    'KIND deployment failed.'
+                )
+            }
         }
 
         aborted {
-            echo 'ASP.NET CI or Amazon ECR publication was aborted.'
+            echo 'ASP.NET CI, ECR publication, or KIND deployment was aborted.'
         }
     }
 }
